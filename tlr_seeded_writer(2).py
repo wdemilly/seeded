@@ -6,17 +6,18 @@ import io
 from docx import Document
 from docx.shared import Pt
 
-# ─── PAGE CONFIG ─────────────────────────────────────────────────
 st.set_page_config(page_title="TLR Seeded Outline Writer", layout="wide")
 st.title("TLR — Seeded Outline Writer")
 
-# ─── SESSION STATE INIT ─────────────────────────────────────────
+# ─── SESSION STATE ───────────────────────────────────────────────
 if "chapters" not in st.session_state:
     st.session_state.chapters = {}
 if "scores" not in st.session_state:
     st.session_state.scores = {}
 if "run_count" not in st.session_state:
     st.session_state.run_count = 0
+if "cache_stats" not in st.session_state:
+    st.session_state.cache_stats = []
 
 # ─── SIDEBAR ─────────────────────────────────────────────────────
 with st.sidebar:
@@ -56,7 +57,6 @@ Write the chapter now, the way you wrote the source texts. One continuous pass, 
     writing_prompt = st.text_area("Prompt", value=default_prompt, height=180)
 
 
-# ─── FILE READERS ────────────────────────────────────────────────
 def read_upload(uploaded_file):
     if uploaded_file is None:
         return None
@@ -70,18 +70,55 @@ def read_upload(uploaded_file):
         return uploaded_file.read().decode("utf-8", errors="replace")
 
 
-# ─── API CALL ────────────────────────────────────────────────────
-def call_api(client, model, temperature, messages, max_tokens=8192):
+def call_api_cached(client, model, temperature, source_text, profiles_text, outline_text, prompt_text, max_tokens=8192):
+    """Writing call with prompt caching. Source texts + profiles in system
+    message with cache_control. Outline + prompt in user message."""
     response = client.messages.create(
         model=model,
         max_tokens=max_tokens,
         temperature=temperature,
-        messages=messages,
+        system=[
+            {
+                "type": "text",
+                "text": f"=== CHARACTER PROFILES ===\n{profiles_text}\n\n=== SOURCE TEXTS ===\n{source_text}",
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+        messages=[
+            {
+                "role": "user",
+                "content": f"=== CHAPTER OUTLINE ===\n{outline_text}\n\n=== INSTRUCTION ===\n{prompt_text}",
+            }
+        ],
     )
-    return response.content[0].text, response.usage
+    text = response.content[0].text
+    usage = response.usage
+    return text, {
+        "input": usage.input_tokens,
+        "output": usage.output_tokens,
+        "cache_creation": getattr(usage, "cache_creation_input_tokens", 0),
+        "cache_read": getattr(usage, "cache_read_input_tokens", 0),
+    }
 
 
-# ─── SCORER ──────────────────────────────────────────────────────
+def call_api_revision(client, model, temperature, revision_prompt, chapter_text, max_tokens=8192):
+    """Revision call — no caching."""
+    response = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        messages=[{"role": "user", "content": revision_prompt + chapter_text}],
+    )
+    text = response.content[0].text
+    usage = response.usage
+    return text, {
+        "input": usage.input_tokens,
+        "output": usage.output_tokens,
+        "cache_creation": getattr(usage, "cache_creation_input_tokens", 0),
+        "cache_read": getattr(usage, "cache_read_input_tokens", 0),
+    }
+
+
 def score_chapter(text):
     words = text.split()
     word_count = len(words)
@@ -245,6 +282,15 @@ if st.session_state.chapters:
                 key=f"dl_{st.session_state.run_count}_{key}",
             )
 
+    if st.session_state.cache_stats:
+        with st.expander("Cache & Token Stats"):
+            for stat in st.session_state.cache_stats:
+                ci = stat.get("info", {})
+                cache_read = ci.get("cache_read", 0)
+                cache_write = ci.get("cache_creation", 0)
+                hit = "CACHE HIT" if cache_read > 0 else ("CACHE WRITE" if cache_write > 0 else "NO CACHE")
+                st.text(f"  {stat.get('label','')}: {ci.get('input',0)} in / {ci.get('output',0)} out / {cache_write} write / {cache_read} read — {hit}")
+
     st.divider()
 
 
@@ -268,25 +314,14 @@ if st.button("Write Chapter", type="primary", disabled=not api_key):
 
     st.session_state.chapters = {}
     st.session_state.scores = {}
+    st.session_state.cache_stats = []
     st.session_state.run_count += 1
-
-    user_content = f"""=== CHARACTER PROFILES ===
-{profiles_text}
-
-=== SOURCE TEXTS ===
-{source_text}
-
-=== CHAPTER OUTLINE ===
-{outline_text}
-
-=== INSTRUCTION ===
-{writing_prompt}"""
 
     with st.spinner(f"Writing with {writing_model} at temp {writing_temp}..."):
         try:
-            chapter_text, usage = call_api(
+            chapter_text, cache_info = call_api_cached(
                 client, writing_model, writing_temp,
-                [{"role": "user", "content": user_content}]
+                source_text, profiles_text, outline_text, writing_prompt,
             )
         except Exception as e:
             st.error(f"API error: {e}")
@@ -294,15 +329,16 @@ if st.button("Write Chapter", type="primary", disabled=not api_key):
 
     st.session_state.chapters["original"] = chapter_text
     st.session_state.scores["original"] = score_chapter(chapter_text)
+    st.session_state.cache_stats.append({"label": "Write", "info": cache_info})
 
     if auto_revise:
         current_text = chapter_text
         for pass_num in range(1, revision_passes + 1):
             with st.spinner(f"Revision pass {pass_num}..."):
                 try:
-                    revised_text, rev_usage = call_api(
+                    revised_text, rev_cache_info = call_api_revision(
                         client, revision_model, revision_temp,
-                        [{"role": "user", "content": REVISION_PROMPT + current_text}]
+                        REVISION_PROMPT, current_text,
                     )
                 except Exception as e:
                     st.error(f"Revision pass {pass_num} error: {e}")
@@ -311,6 +347,7 @@ if st.button("Write Chapter", type="primary", disabled=not api_key):
             current_text = revised_text
             st.session_state.chapters[key] = revised_text
             st.session_state.scores[key] = score_chapter(revised_text)
+            st.session_state.cache_stats.append({"label": f"Rev {pass_num}", "info": rev_cache_info})
 
     st.rerun()
 
